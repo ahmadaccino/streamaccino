@@ -6,7 +6,13 @@
   "devDependencies": {
     "@types/bun": "latest"
   },
+  "scripts": {
+    "upload": "bun run upload.ts"
+  },
   "peerDependencies": {
     "typescript": "^5"
+  },
+  "dependencies": {
+    "@inquirer/prompts": "^8.4.1"
   }
 }
