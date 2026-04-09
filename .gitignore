@@ -39,3 +39,10 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # compiled binary
 streamaccino
 dist/
+
+# AI editor configs
+CLAUDE.md
+.cursor/
+
+# bun init leftover
+index.ts
