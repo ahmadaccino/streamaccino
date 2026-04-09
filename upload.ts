@@ -107,9 +107,14 @@ interface Account {
   id: string;
 }
 
-async function getAccounts(): Promise<Account[]> {
+async function getAccounts(): Promise<{ email: string; accounts: Account[] }> {
   const out = await run(["wrangler", "whoami"]);
   const accounts: Account[] = [];
+
+  // Extract email: "associated with the email user@example.com"
+  const emailMatch = out.match(/associated with the email\s+([^\s.]+@[^\s.]+\.[^\s]+)/);
+  const email = emailMatch ? emailMatch[1].replace(/\.$/, "") : "";
+
   // Parse the ASCII table: │ Name │ ID │
   for (const line of out.split("\n")) {
     const match = line.match(/^│\s+(.+?)\s+│\s+([a-f0-9]{32})\s+│$/);
@@ -117,7 +122,7 @@ async function getAccounts(): Promise<Account[]> {
       accounts.push({ name: match[1].trim(), id: match[2] });
     }
   }
-  return accounts;
+  return { email, accounts };
 }
 
 async function listBuckets(accountId: string): Promise<string[]> {
@@ -227,9 +232,182 @@ async function uploadToR2(
   console.log(`  ✅  Uploaded ${key} in ${elapsed}s`);
 }
 
+// ─── Progress rendering ─────────────────────────────────────────────────────
+
+const BAR_WIDTH = 30;
+const DIM = "\x1b[2m";
+const RESET = "\x1b[0m";
+const BOLD = "\x1b[1m";
+const GREEN = "\x1b[32m";
+const CYAN = "\x1b[36m";
+const YELLOW = "\x1b[33m";
+const CLEAR_LINE = "\x1b[2K";
+const HIDE_CURSOR = "\x1b[?25l";
+const SHOW_CURSOR = "\x1b[?25h";
+
+const MAX_CONCURRENT = 2; // sweet spot: keeps cores busy without thrashing
+
+function formatTime(seconds: number): string {
+  if (!isFinite(seconds) || seconds < 0) return "--:--";
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function formatSize(bytes: number): string {
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+}
+
+function renderBar(pct: number): string {
+  const filled = Math.round(BAR_WIDTH * Math.min(pct, 1));
+  const empty = BAR_WIDTH - filled;
+  return `${GREEN}${'█'.repeat(filled)}${DIM}${'░'.repeat(empty)}${RESET}`;
+}
+
+interface FfmpegProgress {
+  frame: number;
+  fps: number;
+  bitrate: string;
+  totalSize: number;
+  outTimeUs: number;
+  speed: string;
+  progress: string;
+}
+
+function parseFfmpegProgress(chunk: string, state: Partial<FfmpegProgress>): FfmpegProgress {
+  for (const line of chunk.split("\n")) {
+    const [key, ...rest] = line.split("=");
+    const val = rest.join("=").trim();
+    if (!key || !val) continue;
+    switch (key.trim()) {
+      case "frame":        state.frame = parseInt(val) || 0; break;
+      case "fps":          state.fps = parseFloat(val) || 0; break;
+      case "bitrate":      state.bitrate = val; break;
+      case "total_size":   state.totalSize = parseInt(val) || 0; break;
+      case "out_time_us":  state.outTimeUs = parseInt(val) || 0; break;
+      case "speed":        state.speed = val; break;
+      case "progress":     state.progress = val; break;
+    }
+  }
+  return state as FfmpegProgress;
+}
+
+// ─── Multi-job progress display ─────────────────────────────────────────────
+
+interface JobSlot {
+  label: string;
+  state: Partial<FfmpegProgress>;
+  t0: number;
+  durationUs: number;
+  done: boolean;
+  result?: string; // final summary line
+}
+
+class ProgressDisplay {
+  private slots: Map<number, JobSlot> = new Map();
+  private lineCount = 0;
+  private interval: ReturnType<typeof setInterval> | null = null;
+
+  start() {
+    process.stdout.write(HIDE_CURSOR);
+    this.interval = setInterval(() => this.render(), 150);
+  }
+
+  stop() {
+    if (this.interval) clearInterval(this.interval);
+    this.interval = null;
+    // Clear the live area, then print nothing (callers print final results)
+    this.clearLines();
+    process.stdout.write(SHOW_CURSOR);
+  }
+
+  addSlot(id: number, label: string, durationSec: number) {
+    this.slots.set(id, {
+      label,
+      state: {},
+      t0: performance.now(),
+      durationUs: durationSec * 1_000_000,
+      done: false,
+    });
+  }
+
+  updateSlot(id: number, chunk: string) {
+    const slot = this.slots.get(id);
+    if (slot) parseFfmpegProgress(chunk, slot.state);
+  }
+
+  finishSlot(id: number, result: string) {
+    const slot = this.slots.get(id);
+    if (slot) {
+      slot.done = true;
+      slot.result = result;
+    }
+  }
+
+  private clearLines() {
+    if (this.lineCount > 0) {
+      // Move up and clear each line
+      process.stdout.write(`\x1b[${this.lineCount}A`);
+      for (let i = 0; i < this.lineCount; i++) {
+        process.stdout.write(`${CLEAR_LINE}\n`);
+      }
+      process.stdout.write(`\x1b[${this.lineCount}A`);
+    }
+  }
+
+  private render() {
+    this.clearLines();
+
+    const lines: string[] = [];
+    const activeSlots = [...this.slots.entries()].filter(([, s]) => !s.done);
+    const doneSlots = [...this.slots.entries()].filter(([, s]) => s.done);
+
+    // Show completed jobs (compact)
+    for (const [, slot] of doneSlots) {
+      if (slot.result) lines.push(slot.result);
+    }
+
+    // Show active jobs with progress bars
+    for (const [, slot] of activeSlots) {
+      const progress = slot.state as FfmpegProgress;
+      const now = performance.now();
+      const pct = slot.durationUs > 0 ? (progress.outTimeUs ?? 0) / slot.durationUs : 0;
+      const elapsedSec = (now - slot.t0) / 1000;
+      const eta = pct > 0.01 ? (elapsedSec / pct) * (1 - pct) : 0;
+
+      const bar = renderBar(pct);
+      const pctStr = `${(pct * 100).toFixed(1)}%`.padStart(6);
+      const fpsStr = `${CYAN}${(progress.fps ?? 0).toFixed(1)} fps${RESET}`;
+      const frameStr = `${DIM}f:${progress.frame ?? 0}${RESET}`;
+      const bitrateStr = progress.bitrate && progress.bitrate !== "N/A"
+        ? `${YELLOW}${progress.bitrate}${RESET}`
+        : `${DIM}...${RESET}`;
+      const sizeStr = formatSize(progress.totalSize ?? 0);
+      const speedStr = progress.speed && progress.speed !== "N/A" ? progress.speed : "...";
+      const etaStr = `ETA ${formatTime(eta)}`;
+      const elapsedStr = formatTime(elapsedSec);
+
+      lines.push(`  ${slot.label}`);
+      lines.push(`      ${bar}  ${pctStr}  ${fpsStr}  ${frameStr}  ${bitrateStr}  ${sizeStr}  ${speedStr}  ${elapsedStr}/${etaStr}`);
+    }
+
+    // Overall progress
+    const totalDone = doneSlots.length;
+    const total = this.slots.size;
+    if (total > 0) {
+      lines.push(`${DIM}  ── ${totalDone}/${total} complete ──${RESET}`);
+    }
+
+    const output = lines.join("\n") + "\n";
+    process.stdout.write(output);
+    this.lineCount = lines.length;
+  }
+}
+
 // ─── ffmpeg helpers ──────────────────────────────────────────────────────────
 
-async function probeVideo(file: string): Promise<{ width: number; height: number; duration: number }> {
+async function probeVideo(file: string): Promise<{ width: number; height: number; duration: number; fps: number; codec: string; pixFmt: string; size: number }> {
   const out = await run([
     "ffprobe",
     "-v", "quiet",
@@ -241,10 +419,21 @@ async function probeVideo(file: string): Promise<{ width: number; height: number
   const info = JSON.parse(out);
   const vs = info.streams?.find((s: any) => s.codec_type === "video");
   if (!vs) throw new Error("No video stream found");
+
+  let fps = 0;
+  if (vs.r_frame_rate) {
+    const [num, den] = vs.r_frame_rate.split("/").map(Number);
+    if (den) fps = num / den;
+  }
+
   return {
     width: Number(vs.width),
     height: Number(vs.height),
     duration: Number(info.format?.duration ?? vs.duration ?? 0),
+    fps: Math.round(fps * 100) / 100,
+    codec: vs.codec_name ?? "unknown",
+    pixFmt: vs.pix_fmt ?? "unknown",
+    size: Number(info.format?.size ?? 0),
   };
 }
 
@@ -254,6 +443,9 @@ async function encode(
   profile: Profile,
   codec: "h264" | "h265",
   stem: string,
+  durationSec: number,
+  jobId: number,
+  display: ProgressDisplay,
 ): Promise<string> {
   const outFile = join(outDir, `${stem}_${profile.tag}_${codec}.mp4`);
 
@@ -272,6 +464,9 @@ async function encode(
     ",scale=trunc(iw/2)*2:trunc(ih/2)*2",
   ].join("");
 
+  const label = `🎬 ${BOLD}${profile.tag} ${codec.toUpperCase()}${RESET}  ${profile.width}×${profile.height}  ${DIM}crf=${crf} maxrate=${maxrate}${RESET}`;
+  display.addSlot(jobId, label, durationSec);
+
   const args = [
     "ffmpeg", "-y",
     "-i", src,
@@ -283,23 +478,45 @@ async function encode(
     "-an",
     "-movflags", "+faststart",
     "-pix_fmt", "yuv420p",
+    "-progress", "pipe:1",
+    "-nostats",
     outFile,
   ];
 
-  console.log(`  ⏳  Encoding ${profile.tag} ${codec}…`);
   const t0 = performance.now();
+  const proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe" });
 
-  const proc = Bun.spawn(args, { stdout: "ignore", stderr: "pipe" });
-  const stderr = await new Response(proc.stderr).text();
+  let stderrChunks: string[] = [];
+  const stderrPromise = new Response(proc.stderr).text().then((t) => { stderrChunks.push(t); });
+
+  const reader = proc.stdout.getReader();
+  const decoder = new TextDecoder();
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const chunk = decoder.decode(value, { stream: true });
+    display.updateSlot(jobId, chunk);
+  }
+
+  await stderrPromise;
   const code = await proc.exited;
+
   if (code !== 0) {
-    console.error(stderr);
-    throw new Error(`ffmpeg exited ${code} for ${profile.tag} ${codec}`);
+    display.finishSlot(jobId, `  ❌  ${profile.tag} ${codec.toUpperCase()} FAILED`);
+    throw new Error(`ffmpeg exited ${code} for ${profile.tag} ${codec}\n${stderrChunks.join("")}`);
   }
 
   const size = statSync(outFile).size;
-  const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
-  console.log(`  ✅  ${profile.tag} ${codec}  →  ${(size / 1024 / 1024).toFixed(2)} MB  (${elapsed}s)`);
+  const elapsed = (performance.now() - t0) / 1000;
+  const avgBitrate = durationSec > 0 ? ((size * 8) / durationSec / 1000).toFixed(0) : "?";
+  const realtimeX = ((durationSec / elapsed) || 0).toFixed(1);
+
+  display.finishSlot(
+    jobId,
+    `  ✅  ${profile.tag} ${codec.toUpperCase()}  ${GREEN}${formatSize(size)}${RESET}  ${DIM}${avgBitrate} kbps  ${elapsed.toFixed(1)}s (${realtimeX}x realtime)${RESET}`,
+  );
+
   return outFile;
 }
 
@@ -322,14 +539,16 @@ async function main() {
   console.log(`\n🎬  Source: ${absInput}`);
 
   const probe = await probeVideo(absInput);
-  console.log(`   ${probe.width}×${probe.height}  •  ${probe.duration.toFixed(1)}s\n`);
+  console.log(`   ${probe.width}×${probe.height}  •  ${probe.duration.toFixed(1)}s  •  ${probe.fps} fps  •  ${probe.codec}  •  ${probe.pixFmt}  •  ${formatSize(probe.size)}\n`);
 
   // 2. Select account
-  const accounts = await getAccounts();
+  const { email, accounts } = await getAccounts();
   if (accounts.length === 0) {
     console.error("❌  No accounts found. Run `wrangler login` first.");
     process.exit(1);
   }
+
+  if (email) console.log(`👤  Logged in as ${email}\n`);
 
   const accountId =
     accounts.length === 1
@@ -342,7 +561,8 @@ async function main() {
           })),
         });
 
-  console.log(`   Using account ${accountId.slice(0, 8)}…\n`);
+  const selectedAccount = accounts.find((a) => a.id === accountId)!;
+  console.log(`   Using ${selectedAccount.name} (${accountId.slice(0, 8)}…)\n`);
 
   // 3. Select bucket
   const buckets = await listBuckets(accountId);
@@ -407,9 +627,11 @@ async function main() {
     process.exit(1);
   }
 
+  const totalJobs = applicableProfiles.length * selectedCodecs.length;
   console.log(`\n📐  Profiles: ${applicableProfiles.map((p) => p.tag).join(", ")}`);
   console.log(`🎞️   Codecs:   ${selectedCodecs.join(", ")}`);
-  console.log(`📦  Dest:     r2://${bucket}/${prefix}${stem}/\n`);
+  console.log(`📦  Dest:     r2://${bucket}/${prefix}${stem}/`);
+  console.log(`📊  Jobs:     ${totalJobs} renditions\n`);
 
   const ok = await confirm({ message: "Start encoding & upload?" });
   if (!ok) process.exit(0);
@@ -418,17 +640,84 @@ async function main() {
   const tmpDir = join(import.meta.dir, ".streamaccino-tmp", stem);
   mkdirSync(tmpDir, { recursive: true });
 
-  console.log(`\n🔧  Encoding to ${tmpDir}\n`);
+  console.log(`\n🔧  Encoding to ${tmpDir}  (${MAX_CONCURRENT} parallel)\n`);
 
-  const outputs: { file: string; key: string }[] = [];
-
+  // Build job list
+  interface EncodeJob {
+    profile: Profile;
+    codec: "h264" | "h265";
+    jobId: number;
+  }
+  const jobs: EncodeJob[] = [];
+  let jobId = 0;
   for (const profile of applicableProfiles) {
     for (const codec of selectedCodecs) {
-      const outFile = await encode(absInput, tmpDir, profile, codec, stem);
-      const key = `${prefix}${stem}/${basename(outFile)}`;
-      outputs.push({ file: outFile, key });
+      jobs.push({ profile, codec, jobId: ++jobId });
     }
   }
+
+  // Run with concurrency pool
+  const display = new ProgressDisplay();
+  display.start();
+
+  const encodeT0 = performance.now();
+  const outputs: { file: string; key: string }[] = [];
+  const pending = new Set<Promise<void>>();
+  const errors: Error[] = [];
+
+  for (const job of jobs) {
+    const p = (async () => {
+      try {
+        const outFile = await encode(
+          absInput, tmpDir, job.profile, job.codec, stem,
+          probe.duration, job.jobId, display,
+        );
+        const key = `${prefix}${stem}/${basename(outFile)}`;
+        outputs.push({ file: outFile, key });
+      } catch (err) {
+        errors.push(err as Error);
+      }
+    })();
+    pending.add(p);
+    p.then(() => pending.delete(p));
+
+    // Limit concurrency
+    if (pending.size >= MAX_CONCURRENT) {
+      await Promise.race(pending);
+    }
+  }
+  // Wait for remaining
+  await Promise.all(pending);
+
+  display.stop();
+
+  if (errors.length > 0) {
+    for (const err of errors) console.error(err.message);
+    console.error(`\n❌  ${errors.length} encoding job(s) failed`);
+    process.exit(1);
+  }
+
+  const encodeElapsed = (performance.now() - encodeT0) / 1000;
+
+  // Print final results
+  console.log("");
+  // Re-print all finished results since display cleared them
+  for (const job of jobs) {
+    const profile = job.profile;
+    const codec = job.codec;
+    const outFile = join(tmpDir, `${stem}_${profile.tag}_${codec}.mp4`);
+    if (existsSync(outFile)) {
+      const size = statSync(outFile).size;
+      const avgBitrate = probe.duration > 0 ? ((size * 8) / probe.duration / 1000).toFixed(0) : "?";
+      console.log(
+        `  ✅  ${profile.tag} ${codec.toUpperCase()}  ${GREEN}${formatSize(size)}${RESET}  ${DIM}${avgBitrate} kbps avg${RESET}`,
+      );
+    }
+  }
+
+  // Encoding summary
+  const totalSize = outputs.reduce((sum, o) => sum + statSync(o.file).size, 0);
+  console.log(`\n  📊  Total: ${GREEN}${formatSize(totalSize)}${RESET} across ${outputs.length} files in ${encodeElapsed.toFixed(1)}s`);
 
   // 8. Upload
   console.log(`\n☁️   Uploading ${outputs.length} files to r2://${bucket}/${prefix}${stem}/\n`);
