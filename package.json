@@ -6,7 +6,10 @@
   "devDependencies": {
     "@types/bun": "latest"
   },
+  "version": "0.1.0",
   "scripts": {
+    "start": "bun run upload.ts",
+    "build": "bun run build.ts",
     "upload": "bun run upload.ts"
   },
   "peerDependencies": {

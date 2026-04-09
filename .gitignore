@@ -35,3 +35,7 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 .streamaccino-tmp/
 
 *.mp4
+
+# compiled binary
+streamaccino
+dist/

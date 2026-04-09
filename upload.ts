@@ -7,7 +7,7 @@
  * Cloudflare R2 via wrangler (uses your `wrangler login` session — no .env needed).
  *
  * Usage:
- *   bun run upload.ts <video-file>
+ *   streamaccino <video-file>
  *
  * Requirements:
  *   - ffmpeg / ffprobe on PATH
@@ -17,6 +17,25 @@
 import { select, input, confirm } from "@inquirer/prompts";
 import { basename, extname, join, resolve } from "path";
 import { existsSync, mkdirSync, statSync, rmSync } from "fs";
+
+const VERSION = "0.1.0";
+
+// Handle --version / -v early
+if (process.argv.includes("--version") || process.argv.includes("-v")) {
+  console.log(`streamaccino v${VERSION}`);
+  process.exit(0);
+}
+if (process.argv.includes("--help") || process.argv.includes("-h")) {
+  console.log(`streamaccino v${VERSION}`);
+  console.log(`\nHero video encoder & R2 uploader`);
+  console.log(`Encodes a source video into a bitrate ladder optimised for short (≤30s)`);
+  console.log(`hero/background videos on the web, then uploads to Cloudflare R2.\n`);
+  console.log(`Usage: streamaccino <video-file>\n`);
+  console.log(`Requirements:`);
+  console.log(`  - ffmpeg / ffprobe on PATH`);
+  console.log(`  - wrangler on PATH, authenticated (wrangler login)`);
+  process.exit(0);
+}
 
 // ─── Encoding profiles ──────────────────────────────────────────────────────
 // CRF + VBV-capped for short hero videos.  Audio is stripped.
@@ -107,15 +126,59 @@ interface Account {
   id: string;
 }
 
+/** Read wrangler's stored OAuth token. */
+function getWranglerToken(): string {
+  const configDir =
+    process.env.XDG_CONFIG_HOME ??
+    join(process.env.HOME ?? "~", "Library", "Preferences");
+  const tokenPath = join(configDir, ".wrangler", "config", "default.toml");
+  if (!existsSync(tokenPath)) return "";
+  const content = require("fs").readFileSync(tokenPath, "utf-8");
+  const m = content.match(/oauth_token\s*=\s*"([^"]+)"/);
+  return m ? m[1] : "";
+}
+
 async function getAccounts(): Promise<{ email: string; accounts: Account[] }> {
+  const token = getWranglerToken();
+
+  // Try the Cloudflare API directly — gives real names, not "(redacted)"
+  if (token) {
+    try {
+      const [userRes, accountsRes] = await Promise.all([
+        fetch("https://api.cloudflare.com/client/v4/user", {
+          headers: { Authorization: `Bearer ${token}` },
+        }),
+        fetch("https://api.cloudflare.com/client/v4/accounts?per_page=50", {
+          headers: { Authorization: `Bearer ${token}` },
+        }),
+      ]);
+
+      let email = "";
+      if (userRes.ok) {
+        const userData = (await userRes.json()) as any;
+        email = userData.result?.email ?? "";
+      }
+
+      if (accountsRes.ok) {
+        const data = (await accountsRes.json()) as any;
+        const accounts: Account[] = (data.result ?? []).map((a: any) => ({
+          name: a.name ?? a.id,
+          id: a.id,
+        }));
+        if (accounts.length > 0) return { email, accounts };
+      }
+    } catch {
+      // Fall through to wrangler parsing
+    }
+  }
+
+  // Fallback: parse wrangler whoami (names may be redacted)
   const out = await run(["wrangler", "whoami"]);
   const accounts: Account[] = [];
 
-  // Extract email: "associated with the email user@example.com"
-  const emailMatch = out.match(/associated with the email\s+([^\s.]+@[^\s.]+\.[^\s]+)/);
-  const email = emailMatch ? emailMatch[1].replace(/\.$/, "") : "";
+  const emailMatch = out.match(/associated with the email\s+(\S+)/);
+  const email = emailMatch ? emailMatch[1].replace(/[.)]+$/, "") : "";
 
-  // Parse the ASCII table: │ Name │ ID │
   for (const line of out.split("\n")) {
     const match = line.match(/^│\s+(.+?)\s+│\s+([a-f0-9]{32})\s+│$/);
     if (match) {
@@ -526,7 +589,7 @@ async function main() {
   // 1. Validate input
   const inputFile = process.argv[2];
   if (!inputFile) {
-    console.error("Usage: bun run upload.ts <video-file>");
+    console.error("Usage: streamaccino <video-file>");
     process.exit(1);
   }
   const absInput = resolve(inputFile);
