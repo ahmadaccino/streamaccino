@@ -16,7 +16,7 @@ import { $ } from "bun";
 
 const VERSION = "0.1.0";
 // Change this to your GitHub username
-const GITHUB_USER = "YOUR_USER";
+const GITHUB_USER = "ahmadaccino";
 const REPO = "streamaccino";
 
 console.log(`\n📦 Building streamaccino v${VERSION}\n`);
